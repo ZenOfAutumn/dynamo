@@ -2,21 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{AsyncEngineContextProvider, ResponseStream};
-use crate::error::{BackendError, DynamoError, ErrorType, match_error_chain};
+use crate::error::{match_error_chain, BackendError, DynamoError, ErrorType};
 use crate::{
     component::{
-        Client, DeviceType, Endpoint, Instance, RoutingInstances, RoutingOccupancyState,
-        get_or_create_routing_occupancy_state,
+        get_or_create_routing_occupancy_state, Client, DeviceType, Endpoint, Instance, RoutingInstances,
+        RoutingOccupancyState,
     },
     discovery::EndpointInstanceId,
     dynamo_nvtx_range,
     engine::{AsyncEngine, AsyncEngineContext, Data},
     metrics::frontend_perf::{STAGE_DURATION_SECONDS, STAGE_ROUTE},
     pipeline::{
-        AddressedPushRouter, AddressedRequest, Error, ManyIn, ManyOut, SingleIn,
-        error::{PipelineError, PipelineErrorExt},
+        error::{PipelineError, PipelineErrorExt}, AddressedPushRouter, AddressedRequest, Error, ManyIn, ManyOut,
+        SingleIn,
     },
-    protocols::{EndpointId, maybe_error::MaybeError},
+    protocols::{maybe_error::MaybeError, EndpointId},
     traits::DistributedRuntimeProvider,
 };
 use async_trait::async_trait;
@@ -28,8 +28,8 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     task::Poll,
     time::Instant,
@@ -1012,24 +1012,41 @@ where
             .await
     }
 
+    /// 为一次设备感知请求构建可选 worker 集合。
+    ///
+    /// 选择分为两个阶段。若某个 worker 缓存了请求所需的全部不同多模态 embedding，
+    /// 则优先选择这类 worker，因为它们无需重新执行图像编码。若不存在全量缓存命中，
+    /// 则将 worker 划分为 CPU 与非 CPU 两组，并根据配置的算力比例确定候选组。
+    /// 调用方随后从返回的候选集合中选择负载最低的 worker。
+    ///
+    /// `instance_ids` 已经过服务发现和准入状态过滤。缓存匹配结果会与该列表取交集，
+    /// 避免缓存索引中的过期记录使不可用 worker 重新进入候选集合。
     fn device_aware_candidates(
         &self,
         request: &T,
         state: &RoutingOccupancyState,
         instance_ids: &[u64],
     ) -> DeviceAwareCandidates {
+        // 设备元数据来自服务发现。未知设备类型保留为 `None`；
+        // `device_aware_candidate_group` 会将所有未明确标记为 CPU 的 worker
+        // 视为非 CPU worker。
         let device_type_map = self
             .client
             .instances()
             .iter()
             .map(|instance| (instance.instance_id, instance.device_type.clone()))
             .collect();
+
+        // 该比例表示一个非 CPU 请求对应多少个 CPU 请求。配置缺失、无法解析或为 0 时，
+        // 默认使用 8。仅当没有 worker 能满足完整 embedding 缓存集合时才使用该比例。
         let cuda_to_cpu_ratio = std::env::var("DYN_ENCODER_CUDA_TO_CPU_RATIO")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value >= 1)
             .unwrap_or(8);
 
+        // 缓存亲和性是可选能力：必须同时提供缓存索引和针对请求的 key 提取器。
+        // 索引返回至少命中一个所需 embedding 的 `(worker_id, hit_count)` 列表。
         let (request_cache_keys, cache_matched_candidates) =
             if let (Some(indexer), Some(extractor)) = (
                 self.multimodal_cache_indexer.as_ref(),
@@ -1040,6 +1057,7 @@ where
                     Vec::new()
                 } else {
                     let mut matched = indexer.workers_with_cache_key_hits(&request_cache_keys);
+                    // 缓存索引可能暂时保留已从服务发现中移除，或被准入控制排除的 worker。
                     matched.retain(|(id, _)| instance_ids.contains(id));
                     matched
                 };
@@ -1048,7 +1066,12 @@ where
                 (Vec::new(), Vec::new())
             };
 
+        // 部分缓存命中仅用于可观测性，不会限制路由候选集合，
+        // 因为该 worker 仍需执行一部分图像编码。
         let embedding_cache_hit = !cache_matched_candidates.is_empty();
+
+        // 判断 worker 是否拥有完整缓存集合时按不同的 key 计数。
+        // 同一图像在请求中被重复引用，不应要求存在多份缓存记录。
         let request_cache_key_count = request_cache_keys
             .iter()
             .collect::<std::collections::HashSet<_>>()
@@ -1060,6 +1083,9 @@ where
             })
             .collect::<Vec<_>>();
         let full_embedding_cache_hit = !full_cache_candidates.is_empty();
+
+        // 全量缓存亲和性优先于 CPU/非 CPU 配额策略。否则根据算力归一化负载
+        // 选择一个设备组；调用方负责在最终候选集合中选择负载最低的 worker。
         let candidates = if full_embedding_cache_hit {
             full_cache_candidates
         } else {
@@ -1071,6 +1097,7 @@ where
             device_type_map,
             embedding_cache_hit,
             full_embedding_cache_hit,
+            // 遥测记录原始 key 数量，而全量命中判断有意使用去重后的 key 数量。
             request_cache_keys: request_cache_keys.len(),
         }
     }
@@ -1738,13 +1765,13 @@ impl<U: Data> crate::engine::AsyncEngineStream<U> for OccupancyTrackedStream<U> 
 mod tests {
     use super::*;
     use crate::{
-        DistributedRuntime, Runtime,
-        distributed::DistributedConfig,
-        error::DynamoError,
+        distributed::DistributedConfig, error::DynamoError,
         pipeline::{
-            RequestStream, ResponseStream,
-            context::{Context, Controller},
+            context::{Context, Controller}, RequestStream,
+            ResponseStream,
         },
+        DistributedRuntime,
+        Runtime,
     };
     use serde::{Deserialize, Serialize};
 
