@@ -1,49 +1,99 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# ==============================================================================
+# 该 Dockerfile 用于构建 DeepSeek-V4 在 SGLang 引擎 + Blackwell (B200) GPU 上运行的镜像。
+# 采用「多阶段构建 (multi-stage build)」：从 Dynamo 源镜像中拷贝所需产物，
+# 叠加到 SGLang 官方基础镜像之上，得到最终的运行镜像。
+# ==============================================================================
+
+# --- 构建参数 (ARG)：可在构建时通过 --build-arg 覆盖 -------------------------
+
+# Dynamo 源镜像：提供 nats-server、etcd、UCX、NIXL、dynamo wheel 等运行时产物。
 ARG DYNAMO_SRC_IMAGE=dynamo:latest-sglang-runtime
+
+# SGLang 基础镜像：DeepSeek-V4 Blackwell 专用版本。
+# 通过 sha256 摘要锁定精确镜像，保证构建可复现（不受同名 tag 被覆盖影响）。
 # based on https://github.com/sgl-project/sglang/pull/23600/changes/6d0858d2a82e18b657c8140c329a336ab3673ff8
 ARG DSV4_BASE_IMAGE=lmsysorg/sglang:deepseek-v4-blackwell@sha256:940f7652dd16b04e82ecc57c4dcb6a3ae7d7283bc38db1ce3c4aa6ae3685c4aa
 
+# --- 阶段一：dynamo_src ------------------------------------------------------
+# 仅作为「产物来源」阶段，后续用 COPY --from=dynamo_src 从中提取文件，
+# 它本身不会进入最终镜像，因此不会带来体积负担。
 FROM ${DYNAMO_SRC_IMAGE} AS dynamo_src
 
+# --- 阶段二：最终镜像 --------------------------------------------------------
+# 以 SGLang 基础镜像作为最终镜像的起点。
 FROM ${DSV4_BASE_IMAGE}
 
+# 让 apt 等工具在非交互模式下运行，避免安装过程卡在交互式提示上。
 ENV DEBIAN_FRONTEND=noninteractive
 
+# 清理与安全升级：
+#   1. 卸载不需要的 pip 包 (black、termplotlib)，精简镜像；
+#   2. 更新 apt 索引；
+#   3. 移除一批多媒体编解码库（存在漏洞且运行时用不到）；
+#   4. 对当前 Ubuntu noble(24.04) 可升级的包做安全升级，降低 CVE 风险；
+#   5. 清理 apt 缓存，减小镜像体积。
 RUN pip uninstall -y black termplotlib \
     && apt-get update \
     && apt-get purge -y libx264-164 libx265-199 libde265-0 libavcodec60 libxvidcore4 \
     && apt list --upgradable 2>/dev/null | tail -n +2 | grep 'noble' | awk -F/ '{print $1}' | xargs -r apt-get install -y --only-upgrade \
     && rm -rf /var/lib/apt/lists/*
 
+# 安装 distro 库（限定版本范围），Dynamo 运行时依赖它做系统发行版探测。
+# --break-system-packages：允许在系统 Python 环境中直接安装（PEP 668 限制）。
 RUN python3 -m pip install --no-cache-dir --break-system-packages "distro>=1.7,<2"
 
+# 从 dynamo 源镜像拷贝控制面所需的二进制：
+#   - nats-server：消息总线，Dynamo 组件间通信；
+#   - etcd：分布式键值存储，用于服务发现 / 元数据。
 COPY --from=dynamo_src /usr/bin/nats-server /usr/bin/nats-server
 COPY --from=dynamo_src /usr/local/bin/etcd /usr/local/bin/etcd
+# 将 etcd 路径加入 PATH，便于直接调用。
 ENV PATH=/usr/local/bin/etcd:${PATH}
 
+# 拷贝 UCX（Unified Communication X）库及其共享库，
+# 用于高性能通信 / 数据传输（NIXL KV 传输的底层依赖）。
 COPY --from=dynamo_src /usr/lib/x86_64-linux-gnu/ucx /usr/lib/x86_64-linux-gnu/ucx
 COPY --from=dynamo_src /usr/lib/x86_64-linux-gnu/libuc*.so* /usr/lib/x86_64-linux-gnu/
 
+# 拷贝 NIXL（NVIDIA Inference Xfer Library）的 Python 包，
+# 用于分离式服务中跨 GPU/节点的 KV-cache 高速传输。
 COPY --from=dynamo_src /usr/local/lib/python3.12/dist-packages/nixl* /usr/local/lib/python3.12/dist-packages/
 
+# 拷贝 Dynamo 预构建的 wheel 包目录（wheelhouse）。
 COPY --from=dynamo_src /opt/dynamo/wheelhouse /opt/dynamo/wheelhouse
+# 安装 Dynamo 运行时与主 wheel：
+#   --force-reinstall：强制覆盖基础镜像中可能存在的旧版本；
+#   --no-deps：不自动拉取依赖，依赖已由基础镜像/前面步骤提供，避免版本冲突；
+# 安装后立即做冒烟校验：确认 deepseek_v4 的 tool parser 已正确注册，否则构建失败。
 RUN pip install --no-cache-dir --force-reinstall --no-deps \
     /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
     /opt/dynamo/wheelhouse/ai_dynamo-*.whl && \
     python3 -c "from dynamo._core import get_tool_parser_names; assert 'deepseek_v4' in get_tool_parser_names(), 'V4 parser missing!'; print('V4 parser verified')"
 
+# 拷贝 Dynamo 的 Python 组件源码（frontend / 各类 backend 等）。
 COPY --from=dynamo_src /workspace/components/src/dynamo /workspace/components/src/dynamo
+# 拷贝开源依赖归属声明文件（合规要求）。
 COPY --from=dynamo_src /workspace/ATTRIBUTIONS-Python.md /workspace/ATTRIBUTIONS-Rust.md /workspace/ATTRIBUTIONS.md /workspace/
 
-# Avoid /workspace/sglang shadowing the dynamo Python package.
+# 设置 PYTHONPATH：
+#   - 将 sglang 的 python 目录指向具体子目录，避免顶层 /workspace/sglang
+#     目录「遮蔽 (shadow)」掉 dynamo 的 Python 包导入；
+#   - 加入 dynamo 组件源码目录，使其可被 import。
 ENV PYTHONPATH=/workspace/sglang/python:/workspace/components/src
 
+# SGLang 的 DeepGEMM (深度矩阵乘) JIT 编译调优开关：
+#   - 关闭预编译（PRECOMPILE=0），避免构建/启动时耗时预编译；
+#   - 开启快速预热（FAST_WARMUP=1），加快首次运行的核函数预热。
 ENV SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 
+# 设置默认工作目录。
 WORKDIR /workspace
 
+# 清空基础镜像可能设置的 ENTRYPOINT，改用下面的 CMD 作为默认命令，
+# 使容器默认进入 bash（便于交互调试，实际部署时通常会覆盖该命令）。
 ENTRYPOINT []
 CMD ["bash"]

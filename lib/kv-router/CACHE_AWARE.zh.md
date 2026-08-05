@@ -319,6 +319,31 @@ $$
 - prefill worker 处理完即把 KV 交给 decode，通常**没有长期 decode 占用**，故其 $\mathrm{decode\_cost\_blocks}_i$
   一般很小或为 0——即 prefill 池选路**主要看 prefill 积压 + 前缀命中**。
 
+prefill worker 的 logit（记为 $\operatorname{logit}^{P}_i$）：
+
+$$
+\begin{aligned}
+\operatorname{logit}^{P}_i ={}&
+\mathrm{prefill\_load\_scale}
+\Bigl[
+\frac{\mathrm{active\_prefill\_tokens}_i + \mathrm{isl\_tokens}}{\mathrm{block\_size}} \\
+&- \mathrm{overlap\_score\_credit}
+\cdot \mathrm{overlap\_credit\_decay}_i
+\cdot \mathrm{device\_overlap\_blocks}_i \\
+&- \mathrm{host\_cache\_hit\_weight}
+\cdot \mathrm{host\_overlap\_blocks}_i \\
+&- \mathrm{disk\_cache\_hit\_weight}
+\cdot \mathrm{disk\_overlap\_blocks}_i \\
+&- \mathrm{shared\_cache\_multiplier}
+\cdot \mathrm{shared\_beyond\_blocks}_i
+\Bigr]
+\underbrace{{}+ \mathrm{potential\_decode\_blocks}_i}_{\approx\, 0\ \text{(prefill 池无长期 decode)}}
+\end{aligned}
+$$
+
+即 prefill 池上实际退化为 $\operatorname{logit}^{P}_i \approx \mathrm{prefill\_load\_scale}\cdot\bigl(\mathrm{raw\_prefill\_blocks}_i - \mathrm{overlap\_credit\_blocks}_i\bigr)$，
+**取 $\arg\min_i \operatorname{logit}^{P}_i$ = 「前缀命中最多、prefill 积压最小」的 prefill worker**。
+
 **② decode worker 的 load（decode 分量主导）**
 
 - $\mathrm{active\_decode\_blocks}_i$：该 decode worker **现有活跃序列占用的 decode KV block 数**
@@ -328,6 +353,21 @@ $$
   即它对 decode 显存的边际占用。
 - 二者相加即 $\mathrm{potential\_decode\_blocks}_i$，衡量 decode 阶段的**显存压力**——decode 池选路
   **主要看 decode KV 占用**；若该池也开启 prefill 跟踪，prefill 分量则反映 decode 前的一次性 prefill。
+
+decode worker 的 logit（记为 $\operatorname{logit}^{D}_i$）：
+
+$$
+\operatorname{logit}^{D}_i =
+\underbrace{\mathrm{prefill\_load\_scale}\cdot\bigl(\mathrm{raw\_prefill\_blocks}_i - \mathrm{overlap\_credit\_blocks}_i\bigr)}_{\text{开启 prefill 跟踪时才非 0：反映落地前的一次性 prefill}}
++ \underbrace{\bigl(\mathrm{active\_decode\_blocks}_i + \mathrm{additional\_active\_blocks}_i\bigr)}_{\mathrm{potential\_decode\_blocks}_i\ \text{(主导项)}}
+$$
+
+当 decode 池不跟踪 prefill（常见配置）时退化为 $\operatorname{logit}^{D}_i \approx \mathrm{potential\_decode\_blocks}_i$，
+**取 $\arg\min_i \operatorname{logit}^{D}_i$ = 「decode KV 占用（现有 + 本请求边际新增）最小」的 decode worker**。
+
+> 两个公式共享同一个 $\operatorname{logit}_i = \mathrm{prefill\_cost\_blocks}_i + \mathrm{decode\_cost\_blocks}_i$（见第二节）；
+> $\operatorname{logit}^{P}$ 与 $\operatorname{logit}^{D}$ 并非两套不同的公式，而是同一公式在两类 worker 上因
+> “哪个分量非 0”而自然呈现的不同主导项。
 
 **关键点：**
 

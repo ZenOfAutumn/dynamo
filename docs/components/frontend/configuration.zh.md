@@ -117,7 +117,7 @@ KServe 消息格式与集成细节请参见 [Frontend Guide](frontend-guide.md)�
 | `--enable-anthropic-api` | `DYN_ENABLE_ANTHROPIC_API` | `false` | 启用 `/v1/messages`（Anthropic Messages API） |
 | `--dyn-chat-processor` | `DYN_CHAT_PROCESSOR` | `dynamo` | Chat 处理器：`dynamo` 或 `vllm` |
 | `--dyn-debug-perf` | `DYN_DEBUG_PERF` | `false` | 输出预处理函数的逐函数耗时（仅 vllm processor） |
-| `--dyn-preprocess-workers` | `DYN_PREPROCESS_WORKERS` | `0` | 用于 CPU 绑定预处理的 worker 进程数。0 = 主事件循环（仅 vllm processor） |
+| `--dyn-preprocess-workers` | `DYN_PREPROCESS_WORKERS` | `0` | **[实验性]** 用于预处理与输出处理的 worker 进程数。取值 `> 0` 时，会创建一个含 N 个 worker 的 `ProcessPoolExecutor`，把 CPU 密集型工作（tokenization、chat template 渲染、detokenization）从主事件循环卸载到独立进程，每个进程拥有各自的 GIL，从而缓解单进程 GIL 竞争、提升高并发下的吞吐。`0`（默认）表示所有处理都在主事件循环上完成，不额外起进程。启动时会预热 worker 池（提前加载 tokenizer 等）。仅 `sglang` chat processor 实际支持；`vllm` processor 在该值非 0 时会直接报错拒绝启动 |
 | `-i` / `--interactive` | `DYN_INTERACTIVE` | `false` | 交互式文本对话模式 |
 
 ## HTTP Endpoint
